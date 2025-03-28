@@ -48,31 +48,66 @@ class MultiHeadAttention(nn.Module):
         return x.transpose(1, 2)
     
     def forward(self, query, key, value, mask=None):
+        """
+        Forward pass for multi-head attention.
+        
+        Args:
+            query: Query tensor of shape [batch_size, seq_len_q, d_model]
+            key: Key tensor of shape [batch_size, seq_len_k, d_model]
+            value: Value tensor of shape [batch_size, seq_len_v, d_model]
+            mask: Optional mask tensor for masked attention
+                If 2D: shape [batch_size, seq_len] - attention mask for padding
+                If 3D: shape [batch_size, seq_len_q, seq_len_k] - custom attention pattern
+                If 4D: shape [batch_size, num_heads, seq_len_q, seq_len_k] - per-head mask
+        
+        Returns:
+            Output tensor of shape [batch_size, seq_len_q, d_model]
+        """
         batch_size = query.size(0)
         
         # Linear projections
-        query = self.query(query)
-        key = self.key(key)
-        value = self.value(value)
+        query = self.query(query)  # [batch_size, seq_len_q, d_model]
+        key = self.key(key)        # [batch_size, seq_len_k, d_model]
+        value = self.value(value)  # [batch_size, seq_len_v, d_model]
         
         # Split heads
-        query = self.split_heads(query)
-        key = self.split_heads(key)
-        value = self.split_heads(value)
+        query = self.split_heads(query)  # [batch_size, num_heads, seq_len_q, d_k]
+        key = self.split_heads(key)      # [batch_size, num_heads, seq_len_k, d_k]
+        value = self.split_heads(value)  # [batch_size, num_heads, seq_len_v, d_k]
         
         # Scaled dot-product attention
+        # [batch_size, num_heads, seq_len_q, d_k] × [batch_size, num_heads, d_k, seq_len_k]
+        # = [batch_size, num_heads, seq_len_q, seq_len_k]
         key_transpose = key.transpose(-1, -2)
         scores = torch.matmul(query, key_transpose) / math.sqrt(self.d_k)
         
+        # Apply attention mask if provided
         if mask is not None:
+            # Prepare mask for proper broadcasting based on its dimensions
+            if mask.dim() == 2:
+                # Convert from [batch_size, seq_len] to [batch_size, 1, 1, seq_len]
+                # This is typically a padding mask
+                mask = mask.unsqueeze(1).unsqueeze(2)
+            elif mask.dim() == 3:
+                # Convert from [batch_size, seq_len_q, seq_len_k] to [batch_size, 1, seq_len_q, seq_len_k]
+                # This can be a causal mask
+                mask = mask.unsqueeze(1)
+            
+            # Apply mask
             scores = scores.masked_fill(mask == 0, -1e9)
         
+        # Apply softmax to get attention weights
         attention_weights = torch.softmax(scores, dim=-1)
+        
+        # Apply attention weights to values
+        # [batch_size, num_heads, seq_len_q, seq_len_k] × [batch_size, num_heads, seq_len_v, d_k]
+        # = [batch_size, num_heads, seq_len_q, d_k]
         context = torch.matmul(attention_weights, value)
         
         # Concatenate heads and put through final linear layer
+        # [batch_size, num_heads, seq_len_q, d_k] -> [batch_size, seq_len_q, num_heads * d_k]
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        output = self.output(context)
+        output = self.output(context)  # [batch_size, seq_len_q, d_model]
         
         return output
 
@@ -176,34 +211,86 @@ class Transformer(nn.Module):
         self.d_model = d_model
         
     def generate_square_subsequent_mask(self, size):
-        # Create a mask to prevent attention to future tokens
-        mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
-        return ~mask  # Invert to get 0s for masked positions
-        
+        """
+        Generate a square mask for the sequence. The masked positions are filled with float('-inf').
+        Unmasked positions are filled with float(0.0).
+        This mask ensures that during self-attention, a token cannot attend to subsequent tokens.
+        """
+        # Create a square matrix where subsequent positions are masked
+        mask = (1 - torch.triu(torch.ones(size, size), diagonal=1)).bool()
+        return mask
+
     def forward(self, src, tgt, src_mask=None, tgt_mask=None):
+        """
+        Forward pass for transformer.
+        
+        Args:
+            src: Source tensor of shape [batch_size, src_seq_len]
+            tgt: Target tensor of shape [batch_size, tgt_seq_len]
+            src_mask: Source mask of shape [batch_size, src_seq_len] (optional)
+                      Used to mask padding tokens in the encoder
+            tgt_mask: Target mask of shape [batch_size, tgt_seq_len] (optional)
+                      Used for masked self-attention in the decoder
+                      
+        Returns:
+            Output tensor of shape [batch_size, tgt_seq_len, tgt_vocab_size]
+        """
+        # Get sequence lengths and batch size
+        batch_size, src_seq_len = src.size()
+        _, tgt_seq_len = tgt.size()
+        
         # Embed and add positional encoding for source
-        src = self.encoder_embedding(src) * math.sqrt(self.d_model)
-        src = self.positional_encoding(src)
-        src = self.dropout(src)
+        src_embedded = self.encoder_embedding(src) * math.sqrt(self.d_model)
+        src_embedded = self.positional_encoding(src_embedded)
+        src_embedded = self.dropout(src_embedded)
         
         # Embed and add positional encoding for target
-        tgt = self.decoder_embedding(tgt) * math.sqrt(self.d_model)
-        tgt = self.positional_encoding(tgt)
-        tgt = self.dropout(tgt)
+        tgt_embedded = self.decoder_embedding(tgt) * math.sqrt(self.d_model)
+        tgt_embedded = self.positional_encoding(tgt_embedded)
+        tgt_embedded = self.dropout(tgt_embedded)
         
-        # Automatically create causal mask for decoder if not provided
-        if tgt_mask is None:
-            tgt_mask = self.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)
-            
+        # Handle source mask (for padding)
+        if src_mask is None:
+            # If no source mask is provided, assume all tokens are valid
+            src_padding_mask = torch.ones(batch_size, src_seq_len, dtype=torch.bool, device=src.device)
+        else:
+            # Use the provided source mask
+            src_padding_mask = src_mask
+        
+        # Handle target mask (for causal attention)
+        # For decoder self-attention, we need to combine:
+        # 1. Causal mask to prevent attending to future tokens
+        # 2. Padding mask (if provided in tgt_mask)
+        
+        # Create causal mask
+        causal_mask = self.generate_square_subsequent_mask(tgt_seq_len).to(tgt.device)
+        
+        # If target mask is provided (as a padding mask), combine with causal mask
+        if tgt_mask is not None:
+            # Convert padding mask [batch_size, tgt_seq_len] to proper format for combination
+            # with causal mask [tgt_seq_len, tgt_seq_len]
+            tgt_padding_mask = tgt_mask.unsqueeze(1).expand(batch_size, tgt_seq_len, tgt_seq_len)
+            # Combine causal and padding masks
+            # Both must be True for a position to be attended to
+            combined_mask = causal_mask.unsqueeze(0) & tgt_padding_mask
+        else:
+            # Just use the causal mask expanded to batch size
+            combined_mask = causal_mask.unsqueeze(0).expand(batch_size, tgt_seq_len, tgt_seq_len)
+        
         # Pass through encoder layers
-        encoder_output = src
+        encoder_output = src_embedded
         for encoder_layer in self.encoder_layers:
-            encoder_output = encoder_layer(encoder_output, src_mask)
+            encoder_output = encoder_layer(encoder_output, src_padding_mask)
             
         # Pass through decoder layers
-        decoder_output = tgt
+        decoder_output = tgt_embedded
         for decoder_layer in self.decoder_layers:
-            decoder_output = decoder_layer(decoder_output, encoder_output, src_mask, tgt_mask)
+            decoder_output = decoder_layer(
+                decoder_output,
+                encoder_output,
+                src_mask=src_padding_mask,
+                tgt_mask=combined_mask
+            )
             
         # Final output projection
         output = self.final_layer(decoder_output)

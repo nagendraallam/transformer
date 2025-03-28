@@ -38,6 +38,12 @@ class TransformerTokenizer:
             else:
                 raise ValueError(f"Tokenizer {tokenizer_name} not found")
         
+        # Set pad token if it doesn't exist
+        if self.tokenizer.pad_token is None:
+            # For models like GPT2 that don't have a pad token by default
+            # Set pad_token to eos_token for convenience
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
         # Add special tokens if provided
         if special_tokens:
             self.tokenizer.add_special_tokens(special_tokens)
@@ -48,6 +54,7 @@ class TransformerTokenizer:
         add_special_tokens: bool = True,
         padding: bool = True,
         truncation: bool = True,
+        max_length: Optional[int] = None,
         return_tensors: str = "pt",
     ) -> Dict[str, torch.Tensor]:
         """
@@ -58,17 +65,21 @@ class TransformerTokenizer:
             add_special_tokens: Whether to add special tokens
             padding: Whether to pad sequences
             truncation: Whether to truncate sequences
+            max_length: Maximum sequence length (overrides the default)
             return_tensors: Format of the returned tensors ("pt" for PyTorch)
             
         Returns:
             Dictionary of encoded inputs
         """
+        # Use the provided max_length if given, otherwise use the default
+        max_len = max_length if max_length is not None else self.max_length
+        
         return self.tokenizer(
             text,
             add_special_tokens=add_special_tokens,
             padding=padding,
             truncation=truncation,
-            max_length=self.max_length,
+            max_length=max_len,
             return_tensors=return_tensors,
         )
     
