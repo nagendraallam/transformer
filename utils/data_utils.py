@@ -53,8 +53,18 @@ class TextDataset(Dataset):
         )
         
         if self.return_tensors:
-            # Remove batch dimension
-            encoding = {k: v.squeeze(0) for k, v in encoding.items()}
+            # The encoding could be a dict of tensors or a single tensor depending on the tokenizer
+            if isinstance(encoding, dict):
+                # Remove batch dimension from each tensor in the dict
+                encoding = {k: v.squeeze(0) for k, v in encoding.items()}
+            elif isinstance(encoding, torch.Tensor):
+                # Create a dict with input_ids and attention_mask
+                input_ids = encoding.squeeze(0)
+                attention_mask = torch.ones_like(input_ids)
+                encoding = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask
+                }
             
         return encoding
 
@@ -116,18 +126,51 @@ class SequencePairDataset(Dataset):
         )
         
         if self.return_tensors:
-            # Remove batch dimension
-            source_encoding = {k: v.squeeze(0) for k, v in source_encoding.items()}
-            target_encoding = {k: v.squeeze(0) for k, v in target_encoding.items()}
+            # Process source encoding
+            if isinstance(source_encoding, dict):
+                source_encoding = {k: v.squeeze(0) for k, v in source_encoding.items()}
+                source_input_ids = source_encoding["input_ids"]
+                source_attention_mask = source_encoding["attention_mask"]
+            elif isinstance(source_encoding, torch.Tensor):
+                source_input_ids = source_encoding.squeeze(0)
+                source_attention_mask = torch.ones_like(source_input_ids)
+            
+            # Process target encoding
+            if isinstance(target_encoding, dict):
+                target_encoding = {k: v.squeeze(0) for k, v in target_encoding.items()}
+                target_input_ids = target_encoding["input_ids"]
+                target_attention_mask = target_encoding["attention_mask"]
+            elif isinstance(target_encoding, torch.Tensor):
+                target_input_ids = target_encoding.squeeze(0)
+                target_attention_mask = torch.ones_like(target_input_ids)
         
-        # Combine encodings
-        encoding = {
-            "input_ids": source_encoding["input_ids"],
-            "attention_mask": source_encoding["attention_mask"],
-            "decoder_input_ids": target_encoding["input_ids"],
-            "decoder_attention_mask": target_encoding["attention_mask"],
-            "labels": target_encoding["input_ids"],
-        }
+            # Combine encodings
+            encoding = {
+                "input_ids": source_input_ids,
+                "attention_mask": source_attention_mask,
+                "decoder_input_ids": target_input_ids,
+                "decoder_attention_mask": target_attention_mask,
+                "labels": target_input_ids,
+            }
+        else:
+            # For non-tensor mode, convert the encodings to the expected format
+            if isinstance(source_encoding, dict) and isinstance(target_encoding, dict):
+                encoding = {
+                    "input_ids": source_encoding["input_ids"],
+                    "attention_mask": source_encoding["attention_mask"],
+                    "decoder_input_ids": target_encoding["input_ids"],
+                    "decoder_attention_mask": target_encoding["attention_mask"],
+                    "labels": target_encoding["input_ids"],
+                }
+            else:
+                # Handle the case where the encodings are not dictionaries
+                encoding = {
+                    "input_ids": source_encoding,
+                    "attention_mask": [1] * len(source_encoding),
+                    "decoder_input_ids": target_encoding,
+                    "decoder_attention_mask": [1] * len(target_encoding),
+                    "labels": target_encoding,
+                }
         
         return encoding
 

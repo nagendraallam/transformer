@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from contextlib import nullcontext
 
 
 class TransformerTrainer:
@@ -22,46 +23,92 @@ class TransformerTrainer:
         self,
         model: nn.Module,
         train_dataloader: DataLoader,
-        val_dataloader: Optional[DataLoader] = None,
+        tokenizer,  # Tokenizer object for decoding predictions
+        criterion: Optional[nn.Module] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
-        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-        criterion: Optional[Callable] = None,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        checkpoint_dir: str = "checkpoints",
-        log_interval: int = 100,
+        scheduler: Optional[Any] = None,
+        val_dataloader: Optional[DataLoader] = None,
+        device: str = "cpu",
+        experiment_dir: str = "./experiments",
+        gradient_accumulation_steps: int = 1,
+        log_interval: int = 10,
+        gradient_checkpointing: bool = False,
+        mixed_precision: bool = False,
+        bf16: bool = False,
+        save_best_only: bool = False,
     ):
         """
         Initialize the trainer.
         
         Args:
-            model: Transformer model
+            model: PyTorch model to train
             train_dataloader: DataLoader for training data
-            val_dataloader: DataLoader for validation data (optional)
-            optimizer: Optimizer for training (optional, defaults to Adam)
-            scheduler: Learning rate scheduler (optional)
-            criterion: Loss function (optional, defaults to CrossEntropyLoss)
-            device: Device to use for training ("cuda" or "cpu")
-            checkpoint_dir: Directory to save checkpoints to
-            log_interval: Number of steps between logging training status
+            tokenizer: Tokenizer for decoding predictions
+            criterion: Loss function (defaults to CrossEntropyLoss)
+            optimizer: Optimizer (defaults to AdamW)
+            scheduler: Learning rate scheduler
+            val_dataloader: DataLoader for validation data
+            device: Device to train on
+            experiment_dir: Directory to save checkpoints and logs
+            gradient_accumulation_steps: Number of steps to accumulate gradients before updating weights
+            log_interval: Log training metrics every N steps
+            gradient_checkpointing: Whether to use gradient checkpointing to save memory
+            mixed_precision: Whether to use mixed precision training
+            bf16: Whether to use bfloat16 precision instead of float16
+            save_best_only: Whether to save only the best model during training
         """
         self.model = model
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
-        
-        # Default optimizer is Adam
-        self.optimizer = optimizer or optim.Adam(model.parameters(), lr=1e-4)
-        self.scheduler = scheduler
-        
-        # Default criterion is CrossEntropyLoss
-        self.criterion = criterion or nn.CrossEntropyLoss(ignore_index=0)  # ignore padding
-        
+        self.tokenizer = tokenizer
         self.device = device
+        self.experiment_dir = experiment_dir
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.log_interval = log_interval
+        self.gradient_checkpointing = gradient_checkpointing
+        self.bf16 = bf16
+        self.save_best_only = save_best_only
+        
+        # Move model to the specified device
         self.model.to(self.device)
         
-        self.checkpoint_dir = checkpoint_dir
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        # Set up criterion if not provided
+        self.criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
         
-        self.log_interval = log_interval
+        # Set up optimizer if not provided
+        self.optimizer = optimizer if optimizer is not None else torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        
+        # Set up scheduler
+        self.scheduler = scheduler
+        
+        # Create experiment directory if it doesn't exist
+        os.makedirs(self.experiment_dir, exist_ok=True)
+        
+        # Initialize mixed precision settings
+        self.mixed_precision = mixed_precision
+        self.scaler = None  # Initialize scaler to None
+        self.amp_dtype = None
+        
+        if self.mixed_precision:
+            # Check if we're on a CUDA device
+            if self.device.startswith("cuda"):
+                # Use proper torch.amp instead of torch.cuda.amp which is deprecated
+                if self.bf16 and torch.cuda.is_bf16_supported():
+                    self.amp_dtype = torch.bfloat16
+                    print("Using bfloat16 precision with native type conversion")
+                else:
+                    self.amp_dtype = torch.float16
+                    # Initialize gradient scaler only with float16 (not needed for bf16)
+                    self.scaler = torch.amp.GradScaler()
+                    print("Using float16 precision with gradient scaling")
+            else:
+                print("Warning: Mixed precision training is only supported on CUDA devices. Using full precision.")
+                self.mixed_precision = False
+        
+        # Setup gradient checkpointing if requested
+        if self.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled")
         
         # Initialize tracking variables
         self.current_epoch = 0
@@ -120,33 +167,64 @@ class TransformerTrainer:
         epoch_loss = 0.0
         start_time = time.time()
         
-        progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.current_epoch}")
+        progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.current_epoch + 1}")
         
         for batch_idx, batch in enumerate(progress_bar):
-            self.optimizer.zero_grad()
+            # Use mixed precision for forward pass if enabled
+            if self.mixed_precision:
+                with torch.amp.autocast(device_type='cuda', dtype=self.amp_dtype) if self.device.startswith('cuda') else nullcontext():
+                    loss = self._compute_loss(batch)
+                
+                # Scale the loss for gradient accumulation
+                loss = loss / self.gradient_accumulation_steps
+                
+                # Use scaler for backward pass if using float16
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            else:
+                loss = self._compute_loss(batch)
+                # Scale the loss for gradient accumulation
+                loss = loss / self.gradient_accumulation_steps
+                loss.backward()
             
-            loss = self._compute_loss(batch)
+            # Only update parameters after accumulating gradients
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_dataloader):
+                if self.scaler is not None:
+                    # Unscale gradients for clipping with float16
+                    self.scaler.unscale_(self.optimizer)
+                    
+                # Clip gradients to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                if self.scaler is not None:
+                    # Update with scaler for float16
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Regular update for fp32 or bf16
+                    self.optimizer.step()
+                
+                # Step the learning rate scheduler if it exists
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                    self.training_history["learning_rate"].append(self.scheduler.get_last_lr()[0])
+                
+                self.optimizer.zero_grad(set_to_none=True)
+                self.global_step += 1
             
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            if self.scheduler is not None:
-                self.scheduler.step()
-                self.training_history["learning_rate"].append(self.scheduler.get_last_lr()[0])
-            
-            epoch_loss += loss.item()
+            # Accumulate unscaled loss for reporting
+            epoch_loss += loss.item() * self.gradient_accumulation_steps
             avg_loss = epoch_loss / (batch_idx + 1)
             
             # Update progress bar
             progress_bar.set_postfix(loss=f"{avg_loss:.4f}")
             
             # Log at intervals
-            if batch_idx % self.log_interval == 0:
+            if (batch_idx + 1) % self.log_interval == 0:
                 elapsed = time.time() - start_time
-                print(f"Step {self.global_step} | Loss: {loss.item():.4f} | {elapsed:.2f}s elapsed")
-            
-            self.global_step += 1
+                print(f"Step {self.global_step} | Loss: {avg_loss:.4f} | {elapsed:.2f}s elapsed")
         
         avg_epoch_loss = epoch_loss / len(self.train_dataloader)
         self.training_history["train_loss"].append(avg_epoch_loss)
@@ -168,7 +246,13 @@ class TransformerTrainer:
         
         with torch.no_grad():
             for batch in tqdm(self.val_dataloader, desc="Validating"):
-                loss = self._compute_loss(batch)
+                # Use mixed precision for evaluation if enabled
+                if self.mixed_precision:
+                    with torch.amp.autocast(device_type='cuda', dtype=self.amp_dtype) if self.device.startswith('cuda') else nullcontext():
+                        loss = self._compute_loss(batch)
+                else:
+                    loss = self._compute_loss(batch)
+                
                 val_loss += loss.item()
         
         avg_val_loss = val_loss / len(self.val_dataloader)
@@ -176,13 +260,12 @@ class TransformerTrainer:
         
         return avg_val_loss
     
-    def train(self, num_epochs: int, save_best_only: bool = True) -> Dict[str, List[float]]:
+    def train(self, num_epochs: int) -> Dict[str, List[float]]:
         """
         Train the model for multiple epochs.
         
         Args:
             num_epochs: Number of epochs to train for
-            save_best_only: Whether to save only the best model
             
         Returns:
             Training history
@@ -199,40 +282,43 @@ class TransformerTrainer:
             train_loss = self.train_epoch()
             print(f"Train Loss: {train_loss:.4f}")
             
-            # Validate
+            # Validate if we have a validation set
             if self.val_dataloader is not None:
                 val_loss = self.validate()
                 print(f"Validation Loss: {val_loss:.4f}")
+                print(f"Validation Perplexity: {self.perplexity(val_loss):.2f}")
                 
-                # Save best model
+                # Save model if it's the best so far
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
-                    print(f"New best validation loss: {val_loss:.4f}")
-                    self.save_checkpoint(is_best=True)
-            else:
-                # If no validation set, save based on training loss
-                self.save_checkpoint(is_best=(epoch == num_epochs - 1))
+                    if self.save_best_only:
+                        checkpoint_path = self.save_checkpoint(is_best=True)
+                        print(f"Saved best model checkpoint to {checkpoint_path}")
+                    else:
+                        checkpoint_path = self.save_checkpoint(is_best=True)
+                        print(f"Saved model checkpoint to {checkpoint_path}")
             
-            # Always save latest
-            if not save_best_only:
-                self.save_checkpoint(is_best=False)
+            # If no validation dataloader or save_best_only is False, save at each epoch
+            if self.val_dataloader is None or not self.save_best_only:
+                checkpoint_path = self.save_checkpoint(is_best=False)
+                print(f"Saved model checkpoint to {checkpoint_path}")
         
         return self.training_history
     
     def save_checkpoint(self, is_best: bool = False) -> str:
         """
-        Save a checkpoint of the model.
+        Save a checkpoint of the model, optimizer, and training state.
         
         Args:
-            is_best: Whether this is the best model so far
+            is_best: Whether this checkpoint is the best model so far
             
         Returns:
             Path to the saved checkpoint
         """
         checkpoint = {
-            "epoch": self.current_epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "epoch": self.current_epoch,
             "global_step": self.global_step,
             "best_val_loss": self.best_val_loss,
             "training_history": self.training_history,
@@ -241,48 +327,45 @@ class TransformerTrainer:
         if self.scheduler is not None:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
         
-        # Save latest checkpoint
-        checkpoint_path = os.path.join(self.checkpoint_dir, "latest_checkpoint.pt")
+        # Save the checkpoint
+        if is_best:
+            checkpoint_path = os.path.join(self.experiment_dir, "best_model.pt")
+        else:
+            checkpoint_path = os.path.join(self.experiment_dir, f"checkpoint_epoch_{self.current_epoch + 1}.pt")
+        
+        # Also save the latest checkpoint
+        latest_path = os.path.join(self.experiment_dir, "latest_checkpoint.pt")
+        
+        # Save the checkpoint
         torch.save(checkpoint, checkpoint_path)
         
-        # Save numbered checkpoint
-        epoch_checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{self.current_epoch}.pt")
-        torch.save(checkpoint, epoch_checkpoint_path)
-        
-        # Save best checkpoint
-        if is_best:
-            best_path = os.path.join(self.checkpoint_dir, "best_model.pt")
-            torch.save(checkpoint, best_path)
-            print(f"Saved best model to {best_path}")
+        # Save a copy as the latest checkpoint
+        torch.save(checkpoint, latest_path)
         
         return checkpoint_path
     
     def load_checkpoint(self, checkpoint_path: str) -> None:
         """
-        Load a checkpoint into the model and optimizer.
+        Load a checkpoint.
         
         Args:
             checkpoint_path: Path to the checkpoint to load
         """
-        if not os.path.isfile(checkpoint_path):
-            raise ValueError(f"No checkpoint found at {checkpoint_path}")
-        
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         
-        if "scheduler_state_dict" in checkpoint and self.scheduler is not None:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        
         self.current_epoch = checkpoint["epoch"]
         self.global_step = checkpoint["global_step"]
         self.best_val_loss = checkpoint["best_val_loss"]
+        self.training_history = checkpoint["training_history"]
         
-        if "training_history" in checkpoint:
-            self.training_history = checkpoint["training_history"]
+        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         
-        print(f"Loaded checkpoint from epoch {self.current_epoch}")
+        print(f"Loaded checkpoint from {checkpoint_path}")
+        print(f"Resuming from epoch {self.current_epoch + 1}")
     
     def plot_training_history(self, save_path: Optional[str] = None) -> None:
         """
@@ -293,17 +376,15 @@ class TransformerTrainer:
         """
         plt.figure(figsize=(12, 4))
         
-        # Plot training and validation loss
+        # Plot losses
         plt.subplot(1, 2, 1)
-        plt.plot(self.training_history["train_loss"], label="Training Loss")
-        
-        if self.val_dataloader is not None and self.training_history["val_loss"]:
+        plt.plot(self.training_history["train_loss"], label="Train Loss")
+        if self.training_history["val_loss"]:
             plt.plot(self.training_history["val_loss"], label="Validation Loss")
-        
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
-        plt.title("Training and Validation Loss")
         plt.legend()
+        plt.title("Training and Validation Loss")
         
         # Plot learning rate
         if self.training_history["learning_rate"]:
@@ -319,11 +400,11 @@ class TransformerTrainer:
             plt.savefig(save_path)
             print(f"Saved training history plot to {save_path}")
         
-        plt.show()
+        plt.close()
     
     def perplexity(self, loss: float) -> float:
         """
-        Calculate perplexity from a loss value.
+        Calculate perplexity from loss.
         
         Args:
             loss: Cross-entropy loss

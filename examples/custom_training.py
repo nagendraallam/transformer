@@ -30,6 +30,11 @@ def train_on_custom_data(
     learning_rate: float = 5e-5,
     max_seq_length: int = 512,
     val_split: float = 0.1,
+    mixed_precision: bool = False,
+    gradient_accumulation_steps: int = 1,
+    gradient_checkpointing: bool = False,
+    bf16: bool = False,
+    save_best_only: bool = True,
 ):
     """
     Train the transformer model on custom data.
@@ -42,6 +47,11 @@ def train_on_custom_data(
         learning_rate: Learning rate
         max_seq_length: Maximum sequence length
         val_split: Validation split ratio
+        mixed_precision: Whether to use mixed precision training
+        gradient_accumulation_steps: Number of steps to accumulate gradients
+        gradient_checkpointing: Whether to use gradient checkpointing to save memory
+        bf16: Whether to use bfloat16 precision instead of float16
+        save_best_only: Whether to save only the best model
     """
     # Select configuration based on model size
     if model_size.lower() == "small":
@@ -103,7 +113,7 @@ def train_on_custom_data(
     )
     
     # Calculate total training steps
-    total_steps = len(dataloaders["train"]) * epochs
+    total_steps = len(dataloaders["train"]) * epochs // gradient_accumulation_steps
     
     # Create optimizer and scheduler
     optimizer = create_optimizer(
@@ -133,10 +143,20 @@ def train_on_custom_data(
         device=device,
         checkpoint_dir="checkpoints",
         log_interval=10,
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=gradient_checkpointing,
+        bf16=bf16,
+        save_best_only=save_best_only,
     )
     
     # Train model
     print(f"Starting training for {epochs} epochs")
+    if mixed_precision:
+        print(f"Using {'bfloat16' if bf16 else 'float16'} mixed precision training")
+    if gradient_checkpointing:
+        print("Using gradient checkpointing for memory efficiency")
+    
     trainer.train(num_epochs=epochs)
     
     # Save final model
@@ -162,6 +182,11 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--max_seq_length", type=int, default=512, help="Maximum sequence length")
     parser.add_argument("--val_split", type=float, default=0.1, help="Validation split ratio")
+    parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Use gradient checkpointing")
+    parser.add_argument("--bf16", action="store_true", help="Use bfloat16 precision (instead of float16)")
+    parser.add_argument("--save_best_only", action="store_true", help="Save only the best model")
     
     args = parser.parse_args()
     
@@ -173,4 +198,9 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         max_seq_length=args.max_seq_length,
         val_split=args.val_split,
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_checkpointing=args.gradient_checkpointing,
+        bf16=args.bf16,
+        save_best_only=args.save_best_only,
     ) 

@@ -88,6 +88,10 @@ def main():
     
     print(f"Using device: {device}")
     
+    # Check if mixed precision is compatible with device
+    if args.mixed_precision and device == "cpu":
+        print("Warning: Mixed precision training is only supported on CUDA devices. It will be automatically disabled.")
+    
     # Select model configuration
     if args.model_size.lower() == "small":
         model_config = SMALL_CONFIG.copy()
@@ -201,11 +205,12 @@ def main():
     trainer = TransformerTrainer(
         model=model,
         train_dataloader=dataloaders["train"],
+        tokenizer=tokenizer,
         val_dataloader=dataloaders["val"],
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,
-        checkpoint_dir=args.save_dir,
+        experiment_dir=args.save_dir,
         log_interval=args.log_interval,
         mixed_precision=opt_config["mixed_precision"],
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -216,7 +221,11 @@ def main():
     
     # Train the model
     print(f"Starting training for {args.epochs} epochs")
-    print(f"Using: {'Mixed precision' if opt_config['mixed_precision'] else 'Full precision'} training")
+    if opt_config["mixed_precision"] and device.startswith("cuda"):
+        print(f"Using: Mixed precision training ({('bfloat16' if opt_config['bf16'] else 'float16')})")
+    else:
+        print("Using: Full precision training")
+    
     if opt_config["gradient_checkpointing"]:
         print("Using gradient checkpointing for memory efficiency")
     

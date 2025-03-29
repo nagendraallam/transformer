@@ -66,8 +66,13 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     """Applies Rotary Position Embeddings to q and k tensors."""
-    cos = cos[position_ids].unsqueeze(1)  # [batch, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [batch, 1, seq_len, dim]
+    # Validate position_ids to prevent out-of-bounds errors
+    max_pos = cos.size(0) - 1
+    clipped_position_ids = torch.clamp(position_ids, 0, max_pos)
+    
+    # Apply rotary embeddings with clipped position ids
+    cos = cos[clipped_position_ids].unsqueeze(1)  # [batch, 1, seq_len, dim]
+    sin = sin[clipped_position_ids].unsqueeze(1)  # [batch, 1, seq_len, dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -146,8 +151,9 @@ class MultiHeadAttention(nn.Module):
                 # Convert from [batch_size, seq_len_q, seq_len_k] to [batch_size, 1, seq_len_q, seq_len_k]
                 mask = mask.unsqueeze(1)
             
-            # Apply mask
-            scores = scores.masked_fill(mask == 0, -1e9)
+            # Use a smaller constant for float16 compatibility
+            min_value = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(mask == 0, min_value)
         
         # Apply softmax to get attention weights - cast to fp32 for stability
         attention_weights = torch.softmax(scores.float(), dim=-1).type_as(scores)
@@ -338,10 +344,14 @@ class Transformer(nn.Module):
         batch_size, src_seq_len = src.size()
         _, tgt_seq_len = tgt.size()
         
+        # Validate input to prevent out-of-bounds errors
+        max_seq_length = getattr(self, 'rotary_emb', None).max_position_embeddings if self.use_rotary_embeddings else 5000
+        
         # Create position ids for rotary embeddings if needed
         if self.use_rotary_embeddings:
-            src_position_ids = torch.arange(src_seq_len, device=src.device).unsqueeze(0).expand(batch_size, -1)
-            tgt_position_ids = torch.arange(tgt_seq_len, device=tgt.device).unsqueeze(0).expand(batch_size, -1)
+            # Ensure position ids are within bounds
+            src_position_ids = torch.arange(min(src_seq_len, max_seq_length), device=src.device).unsqueeze(0).expand(batch_size, -1)
+            tgt_position_ids = torch.arange(min(tgt_seq_len, max_seq_length), device=tgt.device).unsqueeze(0).expand(batch_size, -1)
         
         # Embed source tokens
         src_embedded = self.encoder_embedding(src) * math.sqrt(self.d_model)
