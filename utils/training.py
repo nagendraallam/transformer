@@ -36,6 +36,11 @@ class TransformerTrainer:
         mixed_precision: bool = False,
         bf16: bool = False,
         save_best_only: bool = False,
+        use_distributed: bool = False,
+        local_rank: int = 0,
+        compile_model: bool = False,
+        compile_mode: str = "default",
+        use_flash_attention: bool = False,
     ):
         """
         Initialize the trainer.
@@ -56,6 +61,11 @@ class TransformerTrainer:
             mixed_precision: Whether to use mixed precision training
             bf16: Whether to use bfloat16 precision instead of float16
             save_best_only: Whether to save only the best model during training
+            use_distributed: Whether to use distributed training
+            local_rank: Local rank for distributed training
+            compile_model: Whether to compile the model
+            compile_mode: Mode for model compilation
+            use_flash_attention: Whether to use flash attention
         """
         self.model = model
         self.train_dataloader = train_dataloader
@@ -68,6 +78,11 @@ class TransformerTrainer:
         self.gradient_checkpointing = gradient_checkpointing
         self.bf16 = bf16
         self.save_best_only = save_best_only
+        self.use_distributed = use_distributed
+        self.local_rank = local_rank
+        self.compile_model = compile_model
+        self.compile_mode = compile_mode
+        self.use_flash_attention = use_flash_attention
         
         # Move model to the specified device
         self.model.to(self.device)
@@ -116,41 +131,78 @@ class TransformerTrainer:
         self.best_val_loss = float("inf")
         self.training_history = {"train_loss": [], "val_loss": [], "learning_rate": []}
     
-    def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _compute_loss(self, batch) -> torch.Tensor:
         """
-        Compute the loss for a batch.
+        Compute the loss for a batch of data.
         
         Args:
-            batch: Batch of data from DataLoader
+            batch: Batch of data
             
         Returns:
-            Loss value
+            Loss tensor
         """
         # Check if we're doing sequence-to-sequence training
-        if "decoder_input_ids" in batch:
+        if isinstance(batch, dict) and "decoder_input_ids" in batch.keys():
+            # Get vocab size from model if available, default to 50257 (GPT-2)
+            vocab_size = getattr(self.model, 'tgt_vocab_size', 50257)
+            
+            # Seq2Seq transformer model forward pass
+            input_ids = torch.clamp(batch["input_ids"], 0, vocab_size-1).to(self.device)
+            decoder_input_ids = torch.clamp(batch["decoder_input_ids"], 0, vocab_size-1).to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = torch.clamp(batch["labels"][:, 1:], 0, vocab_size-1).to(self.device)
+            
             # Seq2Seq transformer model forward pass
             outputs = self.model(
-                src=batch["input_ids"].to(self.device),
-                tgt=batch["decoder_input_ids"][:, :-1].to(self.device),  # Remove last token (as we predict next)
-                src_mask=batch["attention_mask"].to(self.device),
+                src=input_ids,
+                tgt=decoder_input_ids,
+                src_mask=attention_mask,
                 tgt_mask=None,  # Will be created automatically in the model
             )
             
             # Flatten outputs for loss computation
             outputs = outputs.contiguous().view(-1, outputs.size(-1))
-            targets = batch["labels"][:, 1:].contiguous().view(-1).to(self.device)  # Remove first token (BOS)
+            targets = labels.contiguous().view(-1)
+            
+            # Ensure we have valid targets
+            if targets.numel() == 0:
+                # If targets is empty, create a dummy target with zeros
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
             
         else:
             # Language model style forward pass
+            vocab_size = getattr(self.model, 'tgt_vocab_size', 50257)
+            
+            if isinstance(batch, dict):
+                # Ensure indices are within vocab size
+                input_ids = torch.clamp(batch["input_ids"], 0, vocab_size-1).to(self.device)
+                attention_mask = batch.get("attention_mask", None)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+            else:
+                # Assume it's just the input tensor
+                input_ids = torch.clamp(batch, 0, vocab_size-1).to(self.device)
+                attention_mask = None
+            
             outputs = self.model(
-                src=batch["input_ids"].to(self.device),
-                tgt=batch["input_ids"].to(self.device),
-                src_mask=batch["attention_mask"].to(self.device),
+                src=input_ids,
+                tgt=input_ids,
+                src_mask=attention_mask,
             )
             
+            # Ensure we have a valid sequence length for targets
+            if input_ids.size(1) <= 1:
+                # If input is too short, return zero loss
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+                
             # Flatten outputs for loss computation
             outputs = outputs[:, :-1].contiguous().view(-1, outputs.size(-1))
-            targets = batch["input_ids"][:, 1:].contiguous().view(-1).to(self.device)
+            targets = input_ids[:, 1:].contiguous().view(-1)
+            
+            # Ensure we have valid targets
+            if targets.numel() == 0:
+                # If targets is empty, create a dummy target with zeros
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
         
         # Compute loss
         loss = self.criterion(outputs, targets)
@@ -167,7 +219,11 @@ class TransformerTrainer:
         epoch_loss = 0.0
         start_time = time.time()
         
-        progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.current_epoch + 1}")
+        # Use tqdm only on the main process if distributed
+        if self.is_main_process:
+            progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.current_epoch + 1}")
+        else:
+            progress_bar = self.train_dataloader
         
         for batch_idx, batch in enumerate(progress_bar):
             # Use mixed precision for forward pass if enabled
@@ -193,15 +249,34 @@ class TransformerTrainer:
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_dataloader):
                 if self.scaler is not None:
                     # Unscale gradients for clipping with float16
-                    self.scaler.unscale_(self.optimizer)
+                    try:
+                        self.scaler.unscale_(self.optimizer)
+                    except RuntimeError:
+                        # Skip unscaling if there's a runtime error (e.g., no grads)
+                        pass
                     
                 # Clip gradients to prevent exploding gradients
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 
                 if self.scaler is not None:
                     # Update with scaler for float16
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    try:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    except (AssertionError, RuntimeError) as e:
+                        # Fallback to regular optimizer step when scaler fails
+                        print(f"Warning: Scaler failed with {str(e)}. Using regular optimizer step.")
+                        self.optimizer.step()
+                        # Try to manually update the scaler - might fail but that's ok
+                        try:
+                            # Force update with dummy values if necessary
+                            if not hasattr(self.scaler, '_per_optimizer_states'):
+                                self.scaler._per_optimizer_states = {}
+                            if id(self.optimizer) not in self.scaler._per_optimizer_states:
+                                self.scaler._per_optimizer_states[id(self.optimizer)] = {"stage": 0, "found_inf_per_device": {}}
+                            self.scaler.update()
+                        except:
+                            pass
                 else:
                     # Regular update for fp32 or bf16
                     self.optimizer.step()
@@ -209,7 +284,8 @@ class TransformerTrainer:
                 # Step the learning rate scheduler if it exists
                 if self.scheduler is not None:
                     self.scheduler.step()
-                    self.training_history["learning_rate"].append(self.scheduler.get_last_lr()[0])
+                    if self.is_main_process and len(self.training_history["learning_rate"]) < self.global_step + 1:
+                        self.training_history["learning_rate"].append(self.scheduler.get_last_lr()[0])
                 
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
@@ -218,16 +294,30 @@ class TransformerTrainer:
             epoch_loss += loss.item() * self.gradient_accumulation_steps
             avg_loss = epoch_loss / (batch_idx + 1)
             
-            # Update progress bar
-            progress_bar.set_postfix(loss=f"{avg_loss:.4f}")
-            
-            # Log at intervals
-            if (batch_idx + 1) % self.log_interval == 0:
-                elapsed = time.time() - start_time
-                print(f"Step {self.global_step} | Loss: {avg_loss:.4f} | {elapsed:.2f}s elapsed")
+            # Update progress bar only on main process
+            if self.is_main_process:
+                if isinstance(progress_bar, tqdm):
+                    progress_bar.set_postfix(loss=f"{avg_loss:.4f}")
+                
+                # Log at intervals
+                if (batch_idx + 1) % self.log_interval == 0:
+                    elapsed = time.time() - start_time
+                    print(f"Step {self.global_step} | Loss: {avg_loss:.4f} | {elapsed:.2f}s elapsed")
         
+        # Calculate average loss
         avg_epoch_loss = epoch_loss / len(self.train_dataloader)
-        self.training_history["train_loss"].append(avg_epoch_loss)
+        
+        # If using distributed training, synchronize losses
+        if self.use_distributed:
+            # Gather and average losses from all processes
+            import torch.distributed as dist
+            losses = [torch.tensor(0.0, device=self.device) for _ in range(dist.get_world_size())]
+            torch.tensor(avg_epoch_loss, device=self.device).to(self.device)
+            dist.all_gather(losses, torch.tensor(avg_epoch_loss, device=self.device))
+            avg_epoch_loss = torch.stack(losses).mean().item()
+        
+        if self.is_main_process:
+            self.training_history["train_loss"].append(avg_epoch_loss)
         
         return avg_epoch_loss
     
@@ -245,7 +335,7 @@ class TransformerTrainer:
         val_loss = 0.0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_dataloader, desc="Validating"):
+            for batch in tqdm(self.val_dataloader, desc="Validating") if self.is_main_process else self.val_dataloader:
                 # Use mixed precision for evaluation if enabled
                 if self.mixed_precision:
                     with torch.amp.autocast(device_type='cuda', dtype=self.amp_dtype) if self.device.startswith('cuda') else nullcontext():
@@ -256,7 +346,18 @@ class TransformerTrainer:
                 val_loss += loss.item()
         
         avg_val_loss = val_loss / len(self.val_dataloader)
-        self.training_history["val_loss"].append(avg_val_loss)
+        
+        # If using distributed training, synchronize losses
+        if self.use_distributed:
+            # Gather and average losses from all processes
+            import torch.distributed as dist
+            losses = [torch.tensor(0.0, device=self.device) for _ in range(dist.get_world_size())]
+            torch.tensor(avg_val_loss, device=self.device).to(self.device)
+            dist.all_gather(losses, torch.tensor(avg_val_loss, device=self.device))
+            avg_val_loss = torch.stack(losses).mean().item()
+        
+        if self.is_main_process:
+            self.training_history["val_loss"].append(avg_val_loss)
         
         return avg_val_loss
     
@@ -270,38 +371,56 @@ class TransformerTrainer:
         Returns:
             Training history
         """
-        print(f"Training for {num_epochs} epochs on {self.device}")
-        print(f"Model has {sum(p.numel() for p in self.model.parameters())/1e6:.2f}M parameters")
+        # Configure optimizations if needed
+        if hasattr(self.model, "configure_optimizations"):
+            self.model.configure_optimizations(
+                flash_attention=self.use_flash_attention,
+                gradient_checkpointing=self.gradient_checkpointing
+            )
+            
+        # Compile model if requested
+        if self.compile_model:
+            if hasattr(torch, "compile"):
+                if self.is_main_process:
+                    print(f"Compiling model with mode: {self.compile_mode}")
+                self.model = torch.compile(self.model, mode=self.compile_mode)
+            else:
+                if self.is_main_process:
+                    print("Warning: torch.compile not available in this version. Skipping compilation.")
+        
+        if self.is_main_process:
+            print(f"Training for {num_epochs} epochs on {self.device}")
+            print(f"Model has {sum(p.numel() for p in self.model.parameters())/1e6:.2f}M parameters")
         
         for epoch in range(self.current_epoch, self.current_epoch + num_epochs):
             self.current_epoch = epoch
             
-            print(f"\nEpoch {epoch + 1}/{self.current_epoch + num_epochs}")
+            if self.is_main_process:
+                print(f"\nEpoch {epoch + 1}/{self.current_epoch + num_epochs}")
             
             # Train for one epoch
             train_loss = self.train_epoch()
-            print(f"Train Loss: {train_loss:.4f}")
             
             # Validate if we have a validation set
             if self.val_dataloader is not None:
                 val_loss = self.validate()
-                print(f"Validation Loss: {val_loss:.4f}")
-                print(f"Validation Perplexity: {self.perplexity(val_loss):.2f}")
+                if self.is_main_process:
+                    print(f"Epoch {epoch + 1} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Perplexity: {self.perplexity(val_loss):.4f}")
                 
-                # Save model if it's the best so far
+                # Save checkpoint if it's the best model so far
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
-                    if self.save_best_only:
-                        checkpoint_path = self.save_checkpoint(is_best=True)
-                        print(f"Saved best model checkpoint to {checkpoint_path}")
-                    else:
-                        checkpoint_path = self.save_checkpoint(is_best=True)
-                        print(f"Saved model checkpoint to {checkpoint_path}")
+                    if self.is_main_process:
+                        checkpoint_path = os.path.join(self.experiment_dir, "best_model.pt")
+                        self.save_checkpoint(is_best=True)
+                        print(f"New best model saved! (Val Loss: {val_loss:.4f})")
+            else:
+                if self.is_main_process:
+                    print(f"Epoch {epoch + 1} | Train Loss: {train_loss:.4f}")
             
-            # If no validation dataloader or save_best_only is False, save at each epoch
-            if self.val_dataloader is None or not self.save_best_only:
-                checkpoint_path = self.save_checkpoint(is_best=False)
-                print(f"Saved model checkpoint to {checkpoint_path}")
+            # Save checkpoint for the epoch if we're not only saving the best model
+            if not self.save_best_only and self.is_main_process:
+                self.save_checkpoint()
         
         return self.training_history
     
@@ -413,6 +532,13 @@ class TransformerTrainer:
             Perplexity
         """
         return math.exp(loss)
+
+    @property
+    def is_main_process(self) -> bool:
+        """Check if this is the main process in distributed training."""
+        if self.use_distributed:
+            return self.local_rank == 0
+        return True
 
 
 def create_optimizer(

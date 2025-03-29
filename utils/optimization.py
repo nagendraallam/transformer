@@ -8,6 +8,12 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 from typing import Optional, List, Dict, Any
 
+try:
+    from lion_pytorch import Lion
+    LION_AVAILABLE = True
+except ImportError:
+    LION_AVAILABLE = False
+
 
 def create_optimizer(
     model: torch.nn.Module,
@@ -23,7 +29,7 @@ def create_optimizer(
     
     Args:
         model: PyTorch model
-        optimizer_name: Name of the optimizer (adamw, adam, sgd)
+        optimizer_name: Name of the optimizer (adamw, adam, sgd, lion)
         learning_rate: Learning rate
         weight_decay: Weight decay
         betas: Beta parameters for Adam-based optimizers
@@ -70,6 +76,19 @@ def create_optimizer(
             lr=learning_rate,
             momentum=kwargs.get("momentum", 0.9),
             **kwargs
+        )
+    elif optimizer_name.lower() == "lion":
+        if not LION_AVAILABLE:
+            raise ImportError("Lion optimizer is not available. Install it with 'pip install lion-pytorch'")
+        
+        # Lion typically uses lower learning rates (1e-4 recommended)
+        lion_lr = learning_rate * 0.1 if learning_rate > 1e-4 else learning_rate
+        optimizer = Lion(
+            optimizer_grouped_parameters,
+            lr=lion_lr,
+            betas=kwargs.get("lion_betas", (0.9, 0.99)),
+            weight_decay=weight_decay,
+            **{k: v for k, v in kwargs.items() if k != "lion_betas"}
         )
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")

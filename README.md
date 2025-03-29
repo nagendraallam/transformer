@@ -1,111 +1,85 @@
-# Enhanced Transformer Implementation
+# Enhanced Transformer
 
-This repository contains an enhanced implementation of the Transformer architecture, incorporating modern improvements and optimizations for better performance and efficiency.
+This project implements an enhanced transformer model with optimizations for training efficiency. It includes several optimization techniques like gradient checkpointing, mixed precision training, flash attention, and more.
 
-## Key Features
+## Features
 
-### Architecture Improvements
+- Transformer encoder-decoder architecture
+- Efficient attention implementations including Flash Attention (when available)
+- Gradient checkpointing for memory efficiency
+- Mixed precision training (fp16/bf16)
+- RMSNorm layer normalization
+- Rotary positional embeddings
+- Lion optimizer support
+- Bucketing for efficient sequence packing
+- Model compilation with torch.compile (experimental)
 
-- **RMSNorm**: Replaces traditional LayerNorm with Root Mean Square Layer Normalization for better training stability and efficiency
-- **Rotary Position Embeddings (RoPE)**: Uses rotary embeddings as an alternative to traditional positional encodings for better handling of sequence information
-- **Pre-LN Architecture**: Applies layer normalization before attention and feed-forward layers for improved training stability
-- **GELU Activation**: Uses Gaussian Error Linear Units instead of ReLU for better performance
-- **Efficient Attention**: Enhanced attention implementation with optimizations for better performance
+## Setup
 
-### Training Enhancements
+```bash
+# Create and activate a virtual environment
+python -m venv venv
+source venv/bin/activate  # For bash/zsh
+# For fish shell:
+source venv/bin/activate.fish
 
-- **Mixed Precision Training**: Support for FP16/BF16 training to speed up computation and reduce memory usage
-- **Gradient Checkpointing**: Option to trade computation for memory by recomputing intermediate activations during backpropagation
-- **Flexible Checkpoint Saving**: Options for saving full checkpoints or weights-only models
-- **Memory Efficiency**: Bias-free linear layers and other optimizations to reduce parameter count
+# Install dependencies
+pip install -r requirements.txt
 
-### Inference Optimizations
-
-- **Weight-Only Inference**: Ability to load just the model weights for efficient inference
-- **Text Generation Controls**: Advanced sampling strategies including temperature, top-k, top-p, and repetition penalty
-- **Multiple Precision Options**: Support for FP32, FP16, and BF16 inference
+# Install optional optimizers
+pip install lion-pytorch
+```
 
 ## Usage
 
 ### Training
 
 ```bash
-python train.py --data data/sample.txt --model_size small --batch_size 4 --epochs 10 --device cuda --mixed_precision
+# Basic training
+python train.py --data data/sample.txt --model_size tiny --batch_size 4 --epochs 3
+
+# Train with optimizations
+python train.py --data data/sample.txt --model_size small --batch_size 4 --epochs 3 \
+    --device cuda --optimizer lion --mixed_precision --gradient_checkpointing \
+    --save_dir checkpoints_optimized
+
+# Train with all optimizations (requires more GPU memory)
+python train.py --data data/sample.txt --model_size small --batch_size 4 --epochs 3 \
+    --device cuda --optimizer lion --mixed_precision --flash_attention \
+    --gradient_checkpointing --compile --save_dir checkpoints_optimized
 ```
 
-Key training parameters:
+### Available Arguments
 
-- `--data`: Path to your training data
-- `--model_size`: Size of model to use (small, medium, large)
+- `--data`: Path to the training data file
+- `--model_size`: Model size (tiny, small, medium, large)
 - `--batch_size`: Batch size for training
-- `--mixed_precision`: Enable mixed precision training (FP16)
-- `--use_rotary_embeddings`: Use rotary embeddings instead of traditional positional encoding
-- `--gradient_checkpointing`: Enable gradient checkpointing for memory efficiency
-- `--gradient_accumulation_steps`: Accumulate gradients over multiple steps
-
-### Inference
-
-```bash
-python inference.py --checkpoint checkpoints/best_model.pt --prompt "The transformer architecture is" --temperature 0.7 --max_length 100
-```
-
-Key inference parameters:
-
-- `--checkpoint`: Path to the model checkpoint
-- `--prompt`: Input text to start generation from
-- `--temperature`: Controls randomness (lower = more deterministic)
-- `--top_k`: Limits vocabulary to top k most likely tokens
-- `--top_p`: Nucleus sampling threshold
-- `--repetition_penalty`: Penalizes repeated tokens
-- `--device`: Device to run on (cuda, cpu)
+- `--epochs`: Number of training epochs
+- `--device`: Device to train on (cpu or cuda)
+- `--optimizer`: Optimizer to use (adam, adamw, lion)
+- `--learning_rate`: Learning rate
+- `--mixed_precision`: Enable mixed precision training
+- `--flash_attention`: Use flash attention when available
+- `--gradient_checkpointing`: Enable gradient checkpointing
+- `--compile`: Use torch.compile for faster training
+- `--bucketing`: Use bucketing for efficient sequence packing
+- `--num_workers`: Number of workers for data loading
+- `--save_dir`: Directory to save model checkpoints
 
 ## Model Configurations
 
-Three model sizes are available:
+- **Tiny**: 128 dimensions, 4 heads, 2 layers (for testing)
+- **Small**: 768 dimensions, 8 heads, 12 layers
+- **Medium**: 1024 dimensions, 16 heads, 12 layers
+- **Large**: 1280 dimensions, 20 heads, 24 layers
 
-- **Small**: 125M parameters (similar to GPT-2 small)
-  - Hidden size: 768
-  - Attention heads: 12
-  - Layers: 6+6 (encoder+decoder)
-- **Medium**: 350M parameters
-  - Hidden size: 1024
-  - Attention heads: 16
-  - Layers: 8+8 (encoder+decoder)
-- **Large**: 750M parameters
-  - Hidden size: 1280
-  - Attention heads: 20
-  - Layers: 12+12 (encoder+decoder)
+## Known Issues and Workarounds
 
-## Implementation Details
+- When using mixed precision training, you may see warnings about "No inf checks were recorded for this optimizer". This is expected and automatically handled by falling back to regular optimizer steps.
+- Torch compile may not work properly with gradient checkpointing - consider using them separately.
+- For large models, reduce batch size and use gradient checkpointing to avoid out-of-memory errors.
+- Flash attention may not be available on all hardware - the model will automatically fall back to standard attention when not available.
 
-The core architecture follows the original "Attention is All You Need" paper with modern enhancements:
+## License
 
-1. **Tokenization**: Uses the Hugging Face Transformers library tokenizers
-2. **Embedding**: Token embeddings + optional rotary position embeddings
-3. **Encoder-Decoder**: Standard transformer with multi-head attention and feed-forward layers
-4. **Normalization**: RMSNorm with Pre-LN ordering
-5. **Inference**: Advanced sampling strategies for text generation
-
-## Saving and Loading Models
-
-For smaller file sizes and more efficient distribution, you can save just the model weights:
-
-```python
-# In your code
-from utils.model_utils import save_model_weights_only
-
-# Save in different formats
-save_model_weights_only(model, "model_weights.pt")  # Regular FP32
-save_model_weights_only(model, "model_weights_fp16.pt", half_precision=True)  # FP16
-```
-
-## Requirements
-
-- PyTorch >= 1.10
-- Transformers library
-- NumPy
-- tqdm
-
-## Acknowledgments
-
-This implementation was inspired by modern transformer architectures, particularly focusing on efficiency improvements from recent research.
+MIT

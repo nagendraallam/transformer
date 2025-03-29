@@ -5,10 +5,10 @@ Configuration file for transformer model parameters.
 # Small model configuration (similar to GPT-2 small)
 SMALL_CONFIG = {
     "d_model": 768,
-    "num_heads": 12,
+    "num_heads": 8,
     "num_encoder_layers": 6,
     "num_decoder_layers": 6,
-    "d_ff": 3072,
+    "d_ff": 2048,
     "max_seq_length": 2048,
     "dropout": 0.1,
     "vocab_size": 50257,  # GPT-2 tokenizer vocab size
@@ -17,12 +17,25 @@ SMALL_CONFIG = {
     "rope_theta": 10000,  # Base for rotary embeddings
 }
 
+# Tiny model configuration for testing
+TINY_CONFIG = {
+    "d_model": 128,
+    "num_heads": 4,
+    "num_encoder_layers": 2,
+    "num_decoder_layers": 2,
+    "d_ff": 512,
+    "max_seq_length": 128,
+    "dropout": 0.1,
+    "activation": "gelu",
+    "use_rotary_embeddings": False,
+}
+
 # Medium model configuration
 MEDIUM_CONFIG = {
     "d_model": 1024,
     "num_heads": 16,
-    "num_encoder_layers": 8,
-    "num_decoder_layers": 8,
+    "num_encoder_layers": 12,
+    "num_decoder_layers": 12,
     "d_ff": 4096,
     "max_seq_length": 2048,
     "dropout": 0.1,
@@ -36,8 +49,8 @@ MEDIUM_CONFIG = {
 LARGE_CONFIG = {
     "d_model": 1280,
     "num_heads": 20,
-    "num_encoder_layers": 12,
-    "num_decoder_layers": 12,
+    "num_encoder_layers": 24,
+    "num_decoder_layers": 24,
     "d_ff": 5120,
     "max_seq_length": 2048,
     "dropout": 0.1,
@@ -51,13 +64,12 @@ LARGE_CONFIG = {
 TRAINING_CONFIG = {
     "batch_size": 8,
     "learning_rate": 5e-5,
+    "epochs": 10,
+    "warmup_steps": 1000,
     "weight_decay": 0.01,
-    "warmup_steps": 10000,
-    "max_steps": 100000,
-    "save_steps": 10000,
-    "eval_steps": 1000,
     "gradient_accumulation_steps": 1,
-    "mixed_precision": False,  # Whether to use mixed precision training
+    "optimizer": "adamw",
+    "scheduler": "linear_warmup",
 }
 
 # Configuration for tokenization
@@ -83,9 +95,10 @@ INFERENCE_CONFIG = {
 
 # Optimization configuration for lower memory usage
 OPTIMIZATION_CONFIG = {
-    "use_flash_attention": False,  # Whether to use flash attention (requires PyTorch 2.0+)
-    "gradient_checkpointing": False,  # Whether to use gradient checkpointing for memory efficiency
-    "bf16": False,  # Whether to use bfloat16 precision
+    "mixed_precision": False,
+    "gradient_checkpointing": False,
+    "bf16": False,
+    "use_flash_attention": False,
 }
 
 # Default configuration to use

@@ -1,6 +1,19 @@
+"""
+Transformer model implementation.
+"""
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
+from typing import Optional, Dict, Tuple
+from .rotary_embeddings import RotaryEmbedding
+from .rmsnorm import RMSNorm
+try:
+    from .flash_attention import FlashMHA
+    FLASH_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLASH_ATTENTION_AVAILABLE = False
 
 
 class RMSNorm(nn.Module):
@@ -66,15 +79,25 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     """Applies Rotary Position Embeddings to q and k tensors."""
-    # Validate position_ids to prevent out-of-bounds errors
-    max_pos = cos.size(0) - 1
-    clipped_position_ids = torch.clamp(position_ids, 0, max_pos)
+    # Get embeddings from the global cos/sin cache
+    if position_ids is not None:
+        # Handle invalid indices
+        max_pos = cos.shape[0] - 1
+        position_ids = torch.clamp(position_ids, 0, max_pos)
+        
+        # Gather the correct embeddings for each position
+        cos = cos[position_ids]
+        sin = sin[position_ids]
     
-    # Apply rotary embeddings with clipped position ids
-    cos = cos[clipped_position_ids].unsqueeze(1)  # [batch, 1, seq_len, dim]
-    sin = sin[clipped_position_ids].unsqueeze(1)  # [batch, 1, seq_len, dim]
+    # Reshape to match the expected shape for rotary embeddings
+    if cos.dim() == 3 and q.dim() == 4:  # (batch, seq, dim) vs (batch, heads, seq, dim)
+        cos = cos.unsqueeze(1)  # (batch, 1, seq, dim)
+        sin = sin.unsqueeze(1)  # (batch, 1, seq, dim)
+    
+    # Apply rotary embeddings
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
+    
     return q_embed, k_embed
 
 
@@ -104,42 +127,55 @@ class MultiHeadAttention(nn.Module):
     
     def forward(self, query, key, value, mask=None, position_ids=None, use_rotary=False, rotary_emb=None):
         """
-        Enhanced forward pass with support for rotary embeddings.
+        Forward pass for multi-head attention.
         
         Args:
             query: Query tensor of shape [batch_size, seq_len_q, d_model]
             key: Key tensor of shape [batch_size, seq_len_k, d_model]
-            value: Value tensor of shape [batch_size, seq_len_v, d_model]
-            mask: Optional mask tensor for masked attention
-            position_ids: Optional position ids for rotary embeddings
+            value: Value tensor of shape [batch_size, seq_len_k, d_model]
+            mask: Attention mask of shape [batch_size, seq_len_q, seq_len_k]
+            position_ids: Position IDs for rotary embeddings
             use_rotary: Whether to use rotary embeddings
             rotary_emb: Rotary embedding module
-        
+            
         Returns:
             Output tensor of shape [batch_size, seq_len_q, d_model]
         """
         batch_size = query.size(0)
         
         # Linear projections
-        query = self.query(query)  # [batch_size, seq_len_q, d_model]
-        key = self.key(key)        # [batch_size, seq_len_k, d_model]
-        value = self.value(value)  # [batch_size, seq_len_v, d_model]
+        q = self.query(query)
+        k = self.key(key)
+        v = self.value(value)
         
-        # Split heads
-        query = self.split_heads(query)  # [batch_size, num_heads, seq_len_q, d_k]
-        key = self.split_heads(key)      # [batch_size, num_heads, seq_len_k, d_k]
-        value = self.split_heads(value)  # [batch_size, num_heads, seq_len_v, d_k]
+        # Split into heads
+        q = self.split_heads(q)
+        k = self.split_heads(k)
+        v = self.split_heads(v)
         
         # Apply rotary embeddings if enabled
         if use_rotary and rotary_emb is not None:
-            q_len = query.shape[2]
-            k_len = key.shape[2]
-            cos, sin = rotary_emb(value, seq_len=max(q_len, k_len))
-            query, key = apply_rotary_pos_emb(query, key, cos, sin, position_ids)
+            # Get the cached cos and sin from the rotary embeddings module
+            if hasattr(rotary_emb, 'cos_cached') and hasattr(rotary_emb, 'sin_cached'):
+                cos = rotary_emb.cos_cached
+                sin = rotary_emb.sin_cached
+                q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+            else:
+                # Fall back to the module's forward method
+                seq_length = q.shape[2]
+                if position_ids is None:
+                    position_ids = torch.arange(seq_length, device=q.device)
+                    position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                q, k = rotary_emb(q, k, position_ids)
         
         # Scaled dot-product attention
-        key_transpose = key.transpose(-1, -2)
-        scores = torch.matmul(query, key_transpose) * self.softmax_scale
+        # q: [batch_size, num_heads, seq_len_q, d_k]
+        # k: [batch_size, num_heads, seq_len_k, d_k]
+        # v: [batch_size, num_heads, seq_len_k, d_k]
+        
+        # Calculate attention scores
+        # [batch_size, num_heads, seq_len_q, seq_len_k]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.softmax_scale
         
         # Apply attention mask if provided
         if mask is not None:
@@ -159,7 +195,7 @@ class MultiHeadAttention(nn.Module):
         attention_weights = torch.softmax(scores.float(), dim=-1).type_as(scores)
         
         # Apply attention weights to values
-        context = torch.matmul(attention_weights, value)
+        context = torch.matmul(attention_weights, v)
         
         # Concatenate heads and put through final linear layer
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
@@ -188,10 +224,15 @@ class FeedForward(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, activation="gelu"):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, activation="gelu", use_flash_attention=False):
         super(EncoderLayer, self).__init__()
         
-        self.self_attention = MultiHeadAttention(d_model, num_heads)
+        # Use Flash MHA if requested and available
+        if use_flash_attention and FLASH_ATTENTION_AVAILABLE:
+            self.self_attention = FlashMHA(d_model, num_heads, dropout)
+        else:
+            self.self_attention = MultiHeadAttention(d_model, num_heads)
+            
         self.feed_forward = FeedForward(d_model, d_ff, activation, dropout)
         
         # Use RMSNorm instead of LayerNorm
@@ -200,13 +241,21 @@ class EncoderLayer(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x, mask=None, position_ids=None, use_rotary=False, rotary_emb=None):
+    def forward(self, x, mask=None, position_ids=None, use_rotary=False, rotary_emb=None, causal=False):
         # Pre-LN architecture: Apply normalization before attention
         normalized_x = self.norm1(x)
-        attn_output = self.self_attention(
-            normalized_x, normalized_x, normalized_x, 
-            mask, position_ids, use_rotary, rotary_emb
-        )
+        
+        if isinstance(self.self_attention, FlashMHA):
+            attn_output = self.self_attention(
+                normalized_x, normalized_x, normalized_x, 
+                mask=mask, use_rotary=use_rotary, rotary_emb=rotary_emb, 
+                position_ids=position_ids, causal=causal
+            )
+        else:
+            attn_output = self.self_attention(
+                normalized_x, normalized_x, normalized_x, 
+                mask=mask, position_ids=position_ids, use_rotary=use_rotary, rotary_emb=rotary_emb
+            )
         
         # Residual connection
         x = x + self.dropout(attn_output)
@@ -222,11 +271,17 @@ class EncoderLayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, activation="gelu"):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, activation="gelu", use_flash_attention=False):
         super(DecoderLayer, self).__init__()
         
-        self.self_attention = MultiHeadAttention(d_model, num_heads)
-        self.cross_attention = MultiHeadAttention(d_model, num_heads)
+        # Use Flash MHA if requested and available
+        if use_flash_attention and FLASH_ATTENTION_AVAILABLE:
+            self.self_attention = FlashMHA(d_model, num_heads, dropout)
+            self.cross_attention = FlashMHA(d_model, num_heads, dropout)
+        else:
+            self.self_attention = MultiHeadAttention(d_model, num_heads)
+            self.cross_attention = MultiHeadAttention(d_model, num_heads)
+            
         self.feed_forward = FeedForward(d_model, d_ff, activation, dropout)
         
         # Use RMSNorm instead of LayerNorm
@@ -239,20 +294,35 @@ class DecoderLayer(nn.Module):
     def forward(self, x, encoder_output, src_mask=None, tgt_mask=None, position_ids=None, use_rotary=False, rotary_emb=None):
         # Pre-LN architecture: Apply normalization before attention
         normalized_x = self.norm1(x)
-        attn_output = self.self_attention(
-            normalized_x, normalized_x, normalized_x, 
-            tgt_mask, position_ids, use_rotary, rotary_emb
-        )
+        
+        if isinstance(self.self_attention, FlashMHA):
+            attn_output = self.self_attention(
+                normalized_x, normalized_x, normalized_x, 
+                mask=tgt_mask, use_rotary=use_rotary, rotary_emb=rotary_emb, 
+                position_ids=position_ids, causal=True
+            )
+        else:
+            attn_output = self.self_attention(
+                normalized_x, normalized_x, normalized_x, 
+                tgt_mask, position_ids, use_rotary, rotary_emb
+            )
         
         # Residual connection
         x = x + self.dropout(attn_output)
         
         # Cross attention with pre-normalization
         normalized_x = self.norm2(x)
-        attn_output = self.cross_attention(
-            normalized_x, encoder_output, encoder_output, 
-            src_mask
-        )
+        
+        if isinstance(self.cross_attention, FlashMHA):
+            attn_output = self.cross_attention(
+                normalized_x, encoder_output, encoder_output, 
+                mask=src_mask
+            )
+        else:
+            attn_output = self.cross_attention(
+                normalized_x, encoder_output, encoder_output, 
+                src_mask
+            )
         
         # Residual connection
         x = x + self.dropout(attn_output)
@@ -268,18 +338,20 @@ class DecoderLayer(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, 
-                 src_vocab_size, 
-                 tgt_vocab_size, 
-                 d_model=512, 
-                 num_heads=8, 
-                 num_encoder_layers=6,
-                 num_decoder_layers=6, 
-                 d_ff=2048, 
-                 max_seq_length=2048, 
-                 dropout=0.1,
-                 activation="gelu",
-                 use_rotary_embeddings=True):
+    def __init__(
+        self, 
+        src_vocab_size, 
+        tgt_vocab_size, 
+        d_model=512, 
+        num_heads=8, 
+        num_encoder_layers=6,
+        num_decoder_layers=6, 
+        d_ff=2048, 
+        max_seq_length=2048, 
+        dropout=0.1,
+        activation="gelu",
+        use_rotary_embeddings=True
+    ):
         super(Transformer, self).__init__()
         
         self.encoder_embedding = nn.Embedding(src_vocab_size, d_model)
@@ -295,16 +367,33 @@ class Transformer(nn.Module):
             )
         else:
             self.positional_encoding = PositionalEncoding(d_model, max_seq_length)
-        
+            
+        # Flash attention support
+        self.flash_attention_enabled = False
+            
         # Create encoder layers
         self.encoder_layers = nn.ModuleList([
-            EncoderLayer(d_model, num_heads, d_ff, dropout, activation) 
+            EncoderLayer(
+                d_model, 
+                num_heads, 
+                d_ff, 
+                dropout, 
+                activation,
+                use_flash_attention=False  # Will be updated in forward pass
+            )
             for _ in range(num_encoder_layers)
         ])
         
         # Create decoder layers
         self.decoder_layers = nn.ModuleList([
-            DecoderLayer(d_model, num_heads, d_ff, dropout, activation) 
+            DecoderLayer(
+                d_model, 
+                num_heads, 
+                d_ff, 
+                dropout, 
+                activation,
+                use_flash_attention=False  # Will be updated in forward pass
+            ) 
             for _ in range(num_decoder_layers)
         ])
         
@@ -314,6 +403,89 @@ class Transformer(nn.Module):
         self.final_layer = nn.Linear(d_model, tgt_vocab_size, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.d_model = d_model
+        
+    def configure_optimizations(self, flash_attention: bool = False, gradient_checkpointing: bool = False):
+        """
+        Configure model optimizations.
+        
+        Args:
+            flash_attention: Whether to use flash attention
+            gradient_checkpointing: Whether to use gradient checkpointing
+        """
+        self.flash_attention_enabled = flash_attention and FLASH_ATTENTION_AVAILABLE
+        
+        if self.flash_attention_enabled:
+            # Re-create the attention layers to use flash attention
+            for layer in self.encoder_layers:
+                layer.self_attention = FlashMHA(
+                    d_model=self.d_model,
+                    num_heads=layer.self_attention.num_heads,
+                    dropout=layer.dropout.p,
+                )
+            
+            for layer in self.decoder_layers:
+                layer.self_attention = FlashMHA(
+                    d_model=self.d_model,
+                    num_heads=layer.self_attention.num_heads,
+                    dropout=layer.dropout.p,
+                )
+                layer.cross_attention = FlashMHA(
+                    d_model=self.d_model,
+                    num_heads=layer.cross_attention.num_heads,
+                    dropout=layer.dropout.p,
+                )
+        
+        # Setup gradient checkpointing
+        if gradient_checkpointing:
+            self.gradient_checkpointing_enable()
+        
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        # Wrap the encoder layers with gradient checkpointing
+        for layer in self.encoder_layers:
+            # Create a custom forward function that preserves function signature
+            def custom_encoder_forward(layer_module, *inputs, **kwargs):
+                def closure(*inputs, **kwargs):
+                    return layer_module(*inputs, **kwargs)
+                return closure
+            
+            # Store original forward method
+            orig_forward = layer.forward
+            
+            # Define a new forward method for checkpointing
+            def make_checkpointed_forward(module, orig_forward):
+                def checkpointed_forward(x, *args, **kwargs):
+                    # Use checkpoint with the original function signature
+                    return torch.utils.checkpoint.checkpoint(
+                        orig_forward,
+                        x, *args,
+                        use_reentrant=False,
+                        **kwargs
+                    )
+                return checkpointed_forward
+            
+            # Apply the checkpointed forward
+            layer.forward = make_checkpointed_forward(layer, orig_forward)
+        
+        # Apply gradient checkpointing to decoder layers
+        for layer in self.decoder_layers:
+            # Store original forward method
+            orig_forward = layer.forward
+            
+            # Define a new forward method for checkpointing
+            def make_checkpointed_forward(module, orig_forward):
+                def checkpointed_forward(x, encoder_output, *args, **kwargs):
+                    # Use checkpoint with the original function signature
+                    return torch.utils.checkpoint.checkpoint(
+                        orig_forward,
+                        x, encoder_output, *args,
+                        use_reentrant=False,
+                        **kwargs
+                    )
+                return checkpointed_forward
+            
+            # Apply the checkpointed forward
+            layer.forward = make_checkpointed_forward(layer, orig_forward)
         
     def generate_square_subsequent_mask(self, size):
         """
@@ -340,7 +512,22 @@ class Transformer(nn.Module):
         Returns:
             Output tensor of shape [batch_size, tgt_seq_len, tgt_vocab_size]
         """
-        # Get sequence lengths and batch size
+        # Get sequence lengths and batch size, ensuring correct dimensions
+        if src.dim() > 2:
+            # If src has more than 2 dimensions, reshape it
+            src_shape = src.size()
+            src = src.view(-1, src_shape[-1])
+            if src_mask is not None:
+                src_mask = src_mask.view(-1, src_mask.size(-1))
+                
+        if tgt.dim() > 2:
+            # If tgt has more than 2 dimensions, reshape it
+            tgt_shape = tgt.size()
+            tgt = tgt.view(-1, tgt_shape[-1])
+            if tgt_mask is not None:
+                tgt_mask = tgt_mask.view(-1, tgt_mask.size(-1))
+        
+        # Get batch size and sequence lengths
         batch_size, src_seq_len = src.size()
         _, tgt_seq_len = tgt.size()
         
@@ -407,7 +594,8 @@ class Transformer(nn.Module):
                 src_padding_mask,
                 src_position_ids if self.use_rotary_embeddings else None,
                 self.use_rotary_embeddings,
-                self.rotary_emb if self.use_rotary_embeddings else None
+                self.rotary_emb if self.use_rotary_embeddings else None,
+                causal=False
             )
             
         # Pass through decoder layers
@@ -431,24 +619,46 @@ class Transformer(nn.Module):
         return output
 
 
-# Keep the original PositionalEncoding class for backward compatibility
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+    """
+    Positional encoding using sine and cosine functions.
+    Implementation adapted from PyTorch's tutorial.
+    """
+    
+    def __init__(self, d_model: int, max_len: int = 5000):
+        """
+        Initialize the positional encoding.
+        
+        Args:
+            d_model: Dimension of the model
+            max_len: Maximum sequence length
+        """
         super(PositionalEncoding, self).__init__()
         
-        # Create positional encoding matrix
+        # Create a buffer to store the positional encodings
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         
+        # Apply sine to even indices
         pe[:, 0::2] = torch.sin(position * div_term)
+        # Apply cosine to odd indices
         pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Add batch dimension and store
         pe = pe.unsqueeze(0)
-        
-        # Register buffer (not a parameter, but should be saved and loaded with the model)
         self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for positional encoding.
         
-    def forward(self, x):
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, d_model]
+            
+        Returns:
+            Tensor with positional encoding added
+        """
         # Add positional encoding to the input
-        x = x + self.pe[:, :x.size(1)]
-        return x 
+        # The [:, :x.size(1), :] ensures we only use the first x.size(1) positions
+        return x + self.pe[:, :x.size(1), :] 
