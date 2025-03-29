@@ -9,9 +9,12 @@ SMALL_CONFIG = {
     "num_encoder_layers": 6,
     "num_decoder_layers": 6,
     "d_ff": 3072,
-    "max_seq_length": 1024,
+    "max_seq_length": 2048,
     "dropout": 0.1,
     "vocab_size": 50257,  # GPT-2 tokenizer vocab size
+    "activation": "gelu",
+    "use_rotary_embeddings": True,
+    "rope_theta": 10000,  # Base for rotary embeddings
 }
 
 # Medium model configuration
@@ -21,9 +24,12 @@ MEDIUM_CONFIG = {
     "num_encoder_layers": 8,
     "num_decoder_layers": 8,
     "d_ff": 4096,
-    "max_seq_length": 1024,
+    "max_seq_length": 2048,
     "dropout": 0.1,
     "vocab_size": 50257,
+    "activation": "gelu",
+    "use_rotary_embeddings": True,
+    "rope_theta": 10000,
 }
 
 # Large model configuration
@@ -33,9 +39,12 @@ LARGE_CONFIG = {
     "num_encoder_layers": 12,
     "num_decoder_layers": 12,
     "d_ff": 5120,
-    "max_seq_length": 1024,
+    "max_seq_length": 2048,
     "dropout": 0.1,
     "vocab_size": 50257,
+    "activation": "gelu",
+    "use_rotary_embeddings": True,
+    "rope_theta": 10000,
 }
 
 # Training configuration
@@ -47,6 +56,8 @@ TRAINING_CONFIG = {
     "max_steps": 100000,
     "save_steps": 10000,
     "eval_steps": 1000,
+    "gradient_accumulation_steps": 1,
+    "mixed_precision": False,  # Whether to use mixed precision training
 }
 
 # Configuration for tokenization
@@ -59,6 +70,22 @@ TOKENIZER_CONFIG = {
         "eos_token": "</s>",
         "mask_token": "<mask>",
     }
+}
+
+# Inference configuration
+INFERENCE_CONFIG = {
+    "temperature": 0.7,
+    "top_k": 50,
+    "top_p": 0.9,
+    "max_length": 100,
+    "repetition_penalty": 1.0,
+}
+
+# Optimization configuration for lower memory usage
+OPTIMIZATION_CONFIG = {
+    "use_flash_attention": False,  # Whether to use flash attention (requires PyTorch 2.0+)
+    "gradient_checkpointing": False,  # Whether to use gradient checkpointing for memory efficiency
+    "bf16": False,  # Whether to use bfloat16 precision
 }
 
 # Default configuration to use

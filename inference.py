@@ -6,14 +6,14 @@ Inference script for the transformer model.
 import os
 import argparse
 import torch
-import torch.nn as nn
-from typing import List
 import numpy as np
 import random
+from typing import List, Optional, Union, Dict, Any
 
 from model import Transformer
 from utils import get_tokenizer
-from configs.model_config import SMALL_CONFIG
+from utils.model_utils import load_model_weights, print_model_size
+from configs.model_config import SMALL_CONFIG, MEDIUM_CONFIG, LARGE_CONFIG, INFERENCE_CONFIG
 
 
 def set_seed(seed: int) -> None:
@@ -25,92 +25,190 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def generate(
-    model: nn.Module,
+def load_model_checkpoint(checkpoint_path: str, device: str):
+    """
+    Load a model from a checkpoint file.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        device: Device to load the model to
+        
+    Returns:
+        Loaded model and model configuration
+    """
+    print(f"Loading model from checkpoint: {checkpoint_path}")
+    
+    # Try to load the checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Determine if this is a full checkpoint or just weights
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        # Full checkpoint with model state, optimizer state, etc.
+        model_state = checkpoint['model_state_dict']
+        
+        # Check if config is stored in the checkpoint
+        if 'config' in checkpoint:
+            model_config = checkpoint['config']
+        else:
+            # Assume small config if not specified
+            print("No model configuration found in checkpoint. Using default small config.")
+            model_config = SMALL_CONFIG
+    else:
+        # Just the model weights
+        model_state = checkpoint
+        # Assume small config if not specified
+        print("Loading weights-only checkpoint. Using default small config.")
+        model_config = SMALL_CONFIG
+    
+    # Create model with the appropriate configuration
+    model = Transformer(
+        src_vocab_size=model_config.get('vocab_size', 50257),
+        tgt_vocab_size=model_config.get('vocab_size', 50257),
+        d_model=model_config.get('d_model', 768),
+        num_heads=model_config.get('num_heads', 12),
+        num_encoder_layers=model_config.get('num_encoder_layers', 6),
+        num_decoder_layers=model_config.get('num_decoder_layers', 6),
+        d_ff=model_config.get('d_ff', 3072),
+        max_seq_length=model_config.get('max_seq_length', 2048),
+        dropout=0.0,  # No dropout during inference
+        activation=model_config.get('activation', 'gelu'),
+        use_rotary_embeddings=model_config.get('use_rotary_embeddings', True),
+    )
+    
+    # Load the model weights
+    model.load_state_dict(model_state)
+    model = model.to(device)
+    model.eval()  # Set to evaluation mode
+    
+    print(f"Successfully loaded model")
+    print_model_size(model)
+    
+    return model, model_config
+
+
+def generate_text(
+    model: Transformer,
     tokenizer,
-    text: str,
+    prompt: str,
     max_length: int = 100,
-    temperature: float = 1.0,
+    temperature: float = 0.7,
     top_k: int = 50,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.0,
+    device: str = 'cpu',
 ) -> str:
     """
     Generate text using the transformer model.
     
     Args:
-        model: Transformer model
-        tokenizer: Tokenizer
-        text: Input text (prompt)
-        max_length: Maximum length of generated text
-        temperature: Sampling temperature
-        top_k: Top-k sampling parameter
-        device: Device to use
+        model: The transformer model
+        tokenizer: The tokenizer to use
+        prompt: The prompt to start generation from
+        max_length: Maximum number of tokens to generate
+        temperature: Temperature for sampling
+        top_k: Number of highest probability tokens to consider for each step
+        top_p: Probability threshold for nucleus sampling
+        repetition_penalty: Penalty for repeating tokens
+        device: Device to run inference on
         
     Returns:
         Generated text
     """
-    model.eval()
+    model.eval()  # Ensure model is in evaluation mode
     
-    # Tokenize input text
-    input_ids = tokenizer.encode(text, return_tensors="pt")["input_ids"].to(device)
+    # Encode the prompt
+    prompt_tokens = tokenizer.encode(prompt, return_tensors='pt').to(device)
     
-    # Initialize output sequence with input
-    output_sequence = input_ids
+    # Create attention mask for the prompt tokens
+    prompt_mask = torch.ones_like(prompt_tokens, dtype=torch.bool)
     
-    # Generate text auto-regressively
+    # Set up for generation
+    generated_tokens = prompt_tokens.clone()
+    generated_mask = prompt_mask.clone()
+    
+    # Create a causal mask for the entire sequence
+    causal_mask = model.generate_square_subsequent_mask(max_length).to(device)
+    
     with torch.no_grad():
+        # Generate tokens one by one
         for _ in range(max_length):
-            # Forward pass
-            outputs = model(
-                src=output_sequence,
-                tgt=output_sequence,
-                src_mask=None,  # Will be created in the model
-                tgt_mask=None,  # Will be created in the model
+            # Get current sequence length
+            seq_len = generated_tokens.shape[1]
+            
+            # Forward pass through encoder and decoder
+            # Use the prompt as both source and target for a language model
+            logits = model(
+                generated_tokens,
+                generated_tokens,
+                src_mask=None,
+                tgt_mask=None,
             )
             
-            # Get the next token logits
-            next_token_logits = outputs[:, -1, :] / temperature
+            # Get the next token logits (last position in sequence)
+            next_token_logits = logits[:, -1, :].squeeze(0)
             
-            # Apply top-k sampling
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for token_id in set(generated_tokens[0].tolist()):
+                    if next_token_logits[token_id] < 0:
+                        next_token_logits[token_id] *= repetition_penalty
+                    else:
+                        next_token_logits[token_id] /= repetition_penalty
+            
+            # Filter with top-k
             if top_k > 0:
-                # Get the top-k logits and their indices
-                top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = float('-inf')
+            
+            # Filter with top-p (nucleus sampling)
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
                 
-                # Create a mask for the top-k tokens
-                mask = torch.zeros_like(next_token_logits).scatter_(1, top_k_indices, 1)
-                next_token_logits = torch.where(mask == 1, next_token_logits, torch.tensor(-float("inf")).to(device))
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_token_logits[indices_to_remove] = float('-inf')
             
-            # Apply softmax to get probabilities
+            # Sample from the filtered distribution
             probs = torch.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, 1).unsqueeze(0)
             
-            # Sample the next token
-            next_token = torch.multinomial(probs, num_samples=1)
-            
-            # Append the token to the output sequence
-            output_sequence = torch.cat([output_sequence, next_token], dim=1)
-            
-            # Break if EOS token is generated
+            # Check if we've hit the end of text token
             if next_token.item() == tokenizer.eos_token_id:
                 break
+            
+            # Append to generated tokens
+            generated_tokens = torch.cat([generated_tokens, next_token], dim=1)
+            # Append to mask
+            next_token_mask = torch.ones_like(next_token, dtype=torch.bool)
+            generated_mask = torch.cat([generated_mask, next_token_mask], dim=1)
     
-    # Decode the output sequence
-    generated_text = tokenizer.decode(output_sequence[0])
-    
+    # Decode the generated tokens
+    generated_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
     return generated_text
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate text with a transformer model")
+    parser = argparse.ArgumentParser(description="Run inference with a transformer model")
     
     # Model parameters
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--model_size", type=str, default="small", help="Model size: small, medium, large")
+    parser.add_argument("--prompt", type=str, required=True, help="Prompt for text generation")
     
     # Generation parameters
-    parser.add_argument("--prompt", type=str, default="", help="Prompt for generation")
-    parser.add_argument("--max_length", type=int, default=100, help="Maximum length of generated text")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling parameter")
+    parser.add_argument("--max_length", type=int, default=INFERENCE_CONFIG["max_length"], help="Maximum number of tokens to generate")
+    parser.add_argument("--temperature", type=float, default=INFERENCE_CONFIG["temperature"], help="Temperature for sampling")
+    parser.add_argument("--top_k", type=int, default=INFERENCE_CONFIG["top_k"], help="Top-k sampling parameter")
+    parser.add_argument("--top_p", type=float, default=INFERENCE_CONFIG["top_p"], help="Top-p (nucleus) sampling parameter")
+    parser.add_argument("--repetition_penalty", type=float, default=INFERENCE_CONFIG["repetition_penalty"], help="Penalty for repeating tokens")
     
     # Other parameters
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -129,55 +227,40 @@ def main():
     
     print(f"Using device: {device}")
     
-    # Select model configuration
-    if args.model_size.lower() == "small":
-        from configs.model_config import SMALL_CONFIG as model_config
-    elif args.model_size.lower() == "medium":
-        from configs.model_config import MEDIUM_CONFIG as model_config
-    elif args.model_size.lower() == "large":
-        from configs.model_config import LARGE_CONFIG as model_config
-    else:
-        raise ValueError(f"Unknown model size: {args.model_size}")
+    # Load model from checkpoint
+    model, model_config = load_model_checkpoint(args.checkpoint, device)
     
     # Initialize tokenizer
-    tokenizer = get_tokenizer(max_length=model_config["max_seq_length"])
+    tokenizer = get_tokenizer(max_length=model_config.get('max_seq_length', 2048))
     
-    # Initialize model
-    model = Transformer(
-        src_vocab_size=tokenizer.vocab_size,
-        tgt_vocab_size=tokenizer.vocab_size,
-        d_model=model_config["d_model"],
-        num_heads=model_config["num_heads"],
-        num_encoder_layers=model_config["num_encoder_layers"],
-        num_decoder_layers=model_config["num_decoder_layers"],
-        d_ff=model_config["d_ff"],
-        max_seq_length=model_config["max_seq_length"],
-        dropout=model_config["dropout"],
-    )
-    
-    # Load checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
-    
-    print(f"Loaded model from {args.checkpoint}")
+    # Print generation parameters
+    print("\nGeneration Parameters:")
+    print(f"  Prompt: '{args.prompt}'")
+    print(f"  Max Length: {args.max_length}")
+    print(f"  Temperature: {args.temperature}")
+    print(f"  Top-k: {args.top_k}")
+    print(f"  Top-p: {args.top_p}")
+    print(f"  Repetition Penalty: {args.repetition_penalty}")
     
     # Generate text
-    if not args.prompt:
-        args.prompt = input("Enter a prompt: ")
+    print("\nGenerating text...")
     
-    generated_text = generate(
+    generated_text = generate_text(
         model=model,
         tokenizer=tokenizer,
-        text=args.prompt,
+        prompt=args.prompt,
         max_length=args.max_length,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
         device=device,
     )
     
-    print("\nGenerated text:")
+    print("\nGenerated Text:")
+    print("-" * 80)
     print(generated_text)
+    print("-" * 80)
 
 
 if __name__ == "__main__":

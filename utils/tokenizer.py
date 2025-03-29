@@ -3,7 +3,7 @@ Tokenizer utilities for text preprocessing.
 """
 
 from typing import List, Dict, Union, Optional
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GPT2Tokenizer
 import os
 import torch
 import json
@@ -154,27 +154,57 @@ class TransformerTokenizer:
         return self.tokenizer.bos_token_id
 
 
-def get_tokenizer(
-    tokenizer_name: str = "gpt2",
-    max_length: int = 1024,
-    use_pretrained: bool = True,
-    special_tokens: Optional[Dict[str, str]] = None,
-) -> TransformerTokenizer:
+def get_tokenizer(pretrained_model_name="gpt2", max_length=None):
     """
-    Helper function to get a preconfigured tokenizer.
+    Get a tokenizer instance.
     
     Args:
-        tokenizer_name: Name of the pretrained tokenizer or path to a saved tokenizer
-        max_length: Maximum sequence length
-        use_pretrained: Whether to use a pretrained tokenizer
-        special_tokens: Dictionary of special tokens to add to the tokenizer
+        pretrained_model_name: Name of the pretrained model to use as tokenizer
+        max_length: Maximum length of sequences
         
     Returns:
-        Initialized tokenizer
+        A tokenizer instance
     """
-    return TransformerTokenizer(
-        tokenizer_name=tokenizer_name,
-        max_length=max_length,
-        use_pretrained=use_pretrained,
-        special_tokens=special_tokens,
-    ) 
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
+        
+        # Ensure special tokens are set, particularly padding token
+        special_tokens = {
+            "pad_token": "<pad>",
+        }
+        
+        # If the tokenizer doesn't have a padding token, set it
+        if tokenizer.pad_token is None:
+            if isinstance(tokenizer, GPT2Tokenizer):
+                # For GPT-2 style models, set pad_token to eos_token if not defined
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                # For other tokenizers, add padding token
+                num_added = tokenizer.add_special_tokens(special_tokens)
+                print(f"Added {num_added} special tokens to the tokenizer")
+        
+        # Set default max length if provided
+        if max_length is not None:
+            tokenizer.model_max_length = max_length
+        
+        print(f"Initialized tokenizer from {pretrained_model_name}")
+        print(f"Vocab size: {tokenizer.vocab_size}")
+        print(f"Max length: {tokenizer.model_max_length}")
+        print(f"Padding token: {tokenizer.pad_token} (id: {tokenizer.pad_token_id})")
+        
+        return tokenizer
+    
+    except Exception as e:
+        print(f"Error loading pretrained tokenizer: {e}")
+        print("Falling back to a new GPT-2 tokenizer")
+        
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        
+        # Ensure padding token is set for GPT-2
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        if max_length is not None:
+            tokenizer.model_max_length = max_length
+        
+        return tokenizer 
