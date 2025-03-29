@@ -13,7 +13,7 @@ from typing import List, Optional, Union, Dict, Any
 from model import Transformer
 from utils import get_tokenizer
 from utils.model_utils import load_model_weights, print_model_size
-from configs.model_config import SMALL_CONFIG, MEDIUM_CONFIG, LARGE_CONFIG, INFERENCE_CONFIG
+from configs.model_config import SMALL_CONFIG, MEDIUM_CONFIG, LARGE_CONFIG, INFERENCE_CONFIG, TINY_CONFIG
 
 
 def set_seed(seed: int) -> None:
@@ -56,9 +56,11 @@ def load_model_checkpoint(checkpoint_path: str, device: str):
     else:
         # Just the model weights
         model_state = checkpoint
-        # Assume small config if not specified
-        print("Loading weights-only checkpoint. Using default small config.")
-        model_config = SMALL_CONFIG
+        # Use TINY_CONFIG for our optimized model
+        print("Loading weights-only checkpoint. Using TINY_CONFIG.")
+        model_config = TINY_CONFIG.copy()
+        # The checkpoint was trained with max_seq_length 2048, so we need to keep it
+        model_config['max_seq_length'] = 2048
     
     # Create model with the appropriate configuration
     model = Transformer(
